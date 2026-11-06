@@ -1,0 +1,1079 @@
+/*
+Copyright 2020 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package router
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/fluxcd/flagger/pkg/apis/flagger/v1beta1"
+	flaggerv1 "github.com/fluxcd/flagger/pkg/apis/flagger/v1beta1"
+	istiov1alpha1 "github.com/fluxcd/flagger/pkg/apis/istio/common/v1alpha1"
+	istiov1beta1 "github.com/fluxcd/flagger/pkg/apis/istio/v1beta1"
+)
+
+func TestUnmarshalVirtualService(t *testing.T) {
+	body := `
+	{
+		"apiVersion": "networking.istio.io/v1beta1",
+		"kind": "VirtualService",
+		"spec": {
+			"gateways": [
+				"default/gateway"
+			],
+			"hosts": [
+				"my.example.com"
+			],
+			"tcp": [
+				{
+					"match": [
+						{
+							"port": 9898
+						}
+					],
+					"route": [
+						{
+							"destination": {
+								"host": "my.example.com",
+								"port": {
+									"number": 9898
+								}
+							}
+						}
+					]
+				}
+			]
+		}
+	}
+	`
+
+	var vs istiov1beta1.VirtualService
+	err := json.Unmarshal([]byte(body), &vs)
+	require.NoError(t, err)
+}
+
+func TestIstioRouter_Sync(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	// test insert
+	_, err = mocks.meshClient.NetworkingV1beta1().DestinationRules("default").Get(context.TODO(), "podinfo-canary", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	_, err = mocks.meshClient.NetworkingV1beta1().DestinationRules("default").Get(context.TODO(), "podinfo-primary", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Len(t, vs.Spec.Http, 1)
+	require.Len(t, vs.Spec.Http[0].Route, 2)
+
+	// test update
+	cd, err := mocks.flaggerClient.FlaggerV1beta1().Canaries("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	cdClone := cd.DeepCopy()
+	hosts := cdClone.Spec.Service.Hosts
+	hosts = append(hosts, "test.example.com")
+	cdClone.Spec.Service.Hosts = hosts
+	canary, err := mocks.flaggerClient.FlaggerV1beta1().Canaries("default").Update(context.TODO(), cdClone, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	// apply change
+	err = router.Reconcile(canary)
+	require.NoError(t, err)
+
+	// verify
+	vs, err = mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Len(t, vs.Spec.Hosts, 2)
+
+	// test drift
+	vsClone := vs.DeepCopy()
+	gateways := vsClone.Spec.Gateways
+	gateways = append(gateways, "istio-system/test-gateway")
+	vsClone.Spec.Gateways = gateways
+	totalGateways := len(mocks.canary.Spec.Service.Gateways)
+
+	vsGateways, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Update(context.TODO(), vsClone, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	totalGateways++
+	assert.Len(t, vsGateways.Spec.Gateways, totalGateways)
+
+	// undo change
+	totalGateways--
+	err = router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	// verify
+	vs, err = mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Len(t, vs.Spec.Gateways, totalGateways)
+}
+
+func TestIstioRouter_SetRoutes(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	pHost := fmt.Sprintf("%s-primary", mocks.canary.Spec.TargetRef.Name)
+	cHost := fmt.Sprintf("%s-canary", mocks.canary.Spec.TargetRef.Name)
+
+	t.Run("normal", func(t *testing.T) {
+		p, c := 60, 40
+		err := router.SetRoutes(mocks.canary, p, c, false)
+		require.NoError(t, err)
+
+		vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		var pRoute, cRoute istiov1beta1.HTTPRouteDestination
+		var mirror *istiov1beta1.Destination
+		for _, http := range vs.Spec.Http {
+			for _, route := range http.Route {
+				if route.Destination.Host == pHost {
+					pRoute = route
+				}
+				if route.Destination.Host == cHost {
+					cRoute = route
+					mirror = http.Mirror
+				}
+			}
+		}
+
+		assert.Equal(t, p, pRoute.Weight)
+		assert.Equal(t, c, cRoute.Weight)
+		assert.Nil(t, mirror)
+
+	})
+
+	t.Run("session affinity", func(t *testing.T) {
+		canary := mocks.canary.DeepCopy()
+		cookieKey := "flagger-cookie"
+		// enable session affinity and start canary run
+		canary.Spec.Analysis.SessionAffinity = &v1beta1.SessionAffinity{
+			CookieName:  cookieKey,
+			Domain:      "flagger.app",
+			HttpOnly:    true,
+			MaxAge:      300,
+			Partitioned: true,
+			Path:        "/app",
+			SameSite:    "Strict",
+			Secure:      true,
+		}
+		err := router.SetRoutes(canary, 0, 10, false)
+
+		vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		assert.Len(t, vs.Spec.Http, 2)
+		stickyRoute := vs.Spec.Http[0]
+		weightedRoute := vs.Spec.Http[1]
+
+		// stickyRoute should match against a cookie and direct all traffic to the canary when a canary run is active.
+		var found bool
+		for _, match := range stickyRoute.Match {
+			if val, ok := match.Headers[cookieHeader]; ok {
+				found = true
+				assert.True(t, strings.Contains(val.Regex, cookieKey))
+				for _, routeDest := range stickyRoute.Route {
+					if routeDest.Destination.Host == pHost {
+						assert.Equal(t, 0, routeDest.Weight)
+					}
+					if routeDest.Destination.Host == cHost {
+						assert.Equal(t, 100, routeDest.Weight)
+					}
+				}
+			}
+		}
+		assert.True(t, found)
+
+		// weightedRoute should do regular weight based routing and inject the Set-Cookie header
+		// for all responses returned from the canary deployment.
+		for _, routeDest := range weightedRoute.Route {
+			if routeDest.Destination.Host == pHost {
+				assert.Equal(t, 0, routeDest.Weight)
+			}
+			if routeDest.Destination.Host == cHost {
+				assert.Equal(t, 10, routeDest.Weight)
+				val, ok := routeDest.Headers.Response.Add[setCookieHeader]
+				assert.True(t, ok)
+				assert.True(t, strings.HasPrefix(val, cookieKey))
+				assert.True(t, strings.Contains(val, "Domain=flagger.app"))
+				assert.True(t, strings.Contains(val, "HttpOnly"))
+				assert.True(t, strings.Contains(val, "Max-Age=300"))
+				assert.True(t, strings.Contains(val, "Partitioned"))
+				assert.True(t, strings.Contains(val, "Path=/app"))
+				assert.True(t, strings.Contains(val, "SameSite=Strict"))
+				assert.True(t, strings.Contains(val, "Secure"))
+			}
+		}
+		assert.True(t, strings.HasPrefix(canary.Status.SessionAffinityCookie, cookieKey))
+
+		// reconcile canary, destination rules, virtual services
+		err = router.Reconcile(canary)
+		require.NoError(t, err)
+
+		reconciledVS, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		// routes should not be changed.
+		assert.Len(t, vs.Spec.Http, 2)
+		assert.NotNil(t, reconciledVS)
+		assert.Equal(t, cmp.Diff(reconciledVS.Spec.Http[0], stickyRoute), "")
+		assert.Equal(t, cmp.Diff(reconciledVS.Spec.Http[1], weightedRoute), "")
+
+		// further continue the canary run
+		err = router.SetRoutes(canary, 50, 50, false)
+		require.NoError(t, err)
+
+		vs, err = mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		assert.Len(t, vs.Spec.Http, 2)
+		stickyRoute = vs.Spec.Http[0]
+		weightedRoute = vs.Spec.Http[1]
+
+		found = false
+		for _, match := range stickyRoute.Match {
+			if val, ok := match.Headers[cookieHeader]; ok {
+				found = true
+				assert.True(t, strings.Contains(val.Regex, cookieKey))
+				for _, routeDest := range stickyRoute.Route {
+					if routeDest.Destination.Host == pHost {
+						assert.Equal(t, 0, routeDest.Weight)
+					}
+					if routeDest.Destination.Host == cHost {
+						assert.Equal(t, 100, routeDest.Weight)
+					}
+				}
+			}
+		}
+		assert.True(t, found)
+
+		for _, routeDest := range weightedRoute.Route {
+			if routeDest.Destination.Host == pHost {
+				assert.Equal(t, 50, routeDest.Weight)
+			}
+			if routeDest.Destination.Host == cHost {
+				assert.Equal(t, 50, routeDest.Weight)
+				val, ok := routeDest.Headers.Response.Add[setCookieHeader]
+				assert.True(t, ok)
+				assert.True(t, strings.HasPrefix(val, cookieKey))
+				assert.True(t, strings.Contains(val, "Domain=flagger.app"))
+				assert.True(t, strings.Contains(val, "HttpOnly"))
+				assert.True(t, strings.Contains(val, "Max-Age=300"))
+				assert.True(t, strings.Contains(val, "Partitioned"))
+				assert.True(t, strings.Contains(val, "Path=/app"))
+				assert.True(t, strings.Contains(val, "SameSite=Strict"))
+				assert.True(t, strings.Contains(val, "Secure"))
+			}
+		}
+		assert.True(t, strings.HasPrefix(canary.Status.SessionAffinityCookie, cookieKey))
+		sessionAffinityCookie := canary.Status.SessionAffinityCookie
+
+		// promotion
+		err = router.SetRoutes(canary, 100, 0, false)
+		require.NoError(t, err)
+
+		vs, err = mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		assert.Len(t, vs.Spec.Http, 2)
+		stickyRoute = vs.Spec.Http[0]
+		weightedRoute = vs.Spec.Http[1]
+
+		found = false
+		for _, match := range stickyRoute.Match {
+			if val, ok := match.Headers[cookieHeader]; ok {
+				found = true
+				assert.True(t, strings.Contains(val.Regex, cookieKey))
+				for _, routeDest := range stickyRoute.Route {
+					if routeDest.Destination.Host == pHost {
+						assert.Equal(t, 100, routeDest.Weight)
+					}
+					if routeDest.Destination.Host == cHost {
+						assert.Equal(t, 0, routeDest.Weight)
+					}
+				}
+			}
+		}
+		assert.True(t, found)
+
+		assert.Equal(t, canary.Status.SessionAffinityCookie, "")
+		assert.Equal(t, canary.Status.PreviousSessionAffinityCookie, sessionAffinityCookie)
+
+		val, ok := stickyRoute.Headers.Response.Add[setCookieHeader]
+		assert.True(t, ok)
+		assert.True(t, strings.HasPrefix(val, sessionAffinityCookie))
+		assert.True(t, strings.Contains(val, "Max-Age=-1"))
+
+		// delete the Set-Cookie header from responses returned by the weighted route
+		for _, routeDest := range weightedRoute.Route {
+			if routeDest.Destination.Host == pHost {
+				assert.Equal(t, 100, routeDest.Weight)
+			}
+			if routeDest.Destination.Host == cHost {
+				assert.Equal(t, 0, routeDest.Weight)
+				if routeDest.Headers != nil && routeDest.Headers.Response != nil {
+					_, ok := routeDest.Headers.Response.Add[setCookieHeader]
+					assert.False(t, ok)
+				}
+			}
+		}
+	})
+
+	t.Run("mirror", func(t *testing.T) {
+		for _, w := range []int{0, 10, 50} {
+			p, c := 100, 0
+
+			// set mirror weight
+			mocks.canary.Spec.Analysis.MirrorWeight = w
+			err := router.SetRoutes(mocks.canary, p, c, true)
+			require.NoError(t, err)
+
+			vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+			require.NoError(t, err)
+
+			var pRoute, cRoute istiov1beta1.HTTPRouteDestination
+			var mirror *istiov1beta1.Destination
+			var mirrorWeight *istiov1beta1.Percent
+			for _, http := range vs.Spec.Http {
+				for _, route := range http.Route {
+					if route.Destination.Host == pHost {
+						pRoute = route
+					}
+					if route.Destination.Host == cHost {
+						cRoute = route
+						mirror = http.Mirror
+						mirrorWeight = http.MirrorPercentage
+					}
+				}
+			}
+
+			assert.Equal(t, p, pRoute.Weight)
+			assert.Equal(t, c, cRoute.Weight)
+			if assert.NotNil(t, mirror) {
+				assert.Equal(t, cHost, mirror.Host)
+			}
+
+			if w > 0 && assert.NotNil(t, mirrorWeight) {
+				assert.Equal(t, w, int(mirrorWeight.Value))
+			} else {
+				assert.Nil(t, mirrorWeight)
+			}
+		}
+	})
+}
+
+func TestIstioRouter_getSessionAffinityRoutes(t *testing.T) {
+	mocks := newFixture(nil)
+	t.Run("without primary cookie", func(t *testing.T) {
+		canary := mocks.canary.DeepCopy()
+		cookieKey := "flagger-cookie"
+		canary.Spec.Analysis.SessionAffinity = &flaggerv1.SessionAffinity{
+			CookieName: cookieKey,
+			MaxAge:     300,
+		}
+
+		router := &IstioRouter{
+			logger:        mocks.logger,
+			flaggerClient: mocks.flaggerClient,
+			istioClient:   mocks.meshClient,
+			kubeClient:    mocks.kubeClient,
+		}
+
+		_, pSvcName, cSvcName := canary.GetServiceNames()
+		weightedRoute := &istiov1beta1.HTTPRoute{
+			Route: []istiov1beta1.HTTPRouteDestination{
+				router.makeDestination(canary, pSvcName, 100),
+				router.makeDestination(canary, cSvcName, 0),
+			},
+		}
+		rules, err := router.getSessionAffinityRouteRules(canary, 10, weightedRoute)
+		require.NoError(t, err)
+		assert.Equal(t, len(rules), 2)
+		assert.True(t, strings.HasPrefix(canary.Status.SessionAffinityCookie, cookieKey))
+
+		stickyRule := rules[0]
+		cookieMatch := stickyRule.Match[0].Headers[cookieHeader]
+		assert.NotNil(t, cookieMatch.Regex)
+		assert.Contains(t, cookieMatch.Regex, cookieKey)
+
+		assert.Equal(t, len(stickyRule.Route), 2)
+		for _, route := range stickyRule.Route {
+			if string(route.Destination.Host) == pSvcName {
+				assert.Equal(t, route.Weight, int(0))
+			}
+			if string(route.Destination.Host) == cSvcName {
+				assert.Equal(t, route.Weight, int(100))
+			}
+		}
+
+		weightedRule := rules[1]
+		var found bool
+		for _, route := range weightedRule.Route {
+			if string(route.Destination.Host) == cSvcName {
+				found = true
+
+				assert.NotNil(t, route.Headers.Response.Add)
+				assert.Equal(t, route.Headers.Response.Add[setCookieHeader], fmt.Sprintf("%s; %s=%d", canary.Status.SessionAffinityCookie, maxAgeAttr, 300))
+			}
+		}
+		assert.True(t, found)
+
+		rules, err = router.getSessionAffinityRouteRules(canary, 0, weightedRoute)
+		require.NoError(t, err)
+		assert.Empty(t, canary.Status.SessionAffinityCookie)
+		assert.Contains(t, canary.Status.PreviousSessionAffinityCookie, cookieKey)
+
+		stickyRule = rules[0]
+		cookieMatch = stickyRule.Match[0].Headers[cookieHeader]
+		assert.NotNil(t, cookieMatch.Regex)
+		assert.Contains(t, cookieMatch.Regex, cookieKey)
+
+		assert.NotNil(t, stickyRule.Headers.Response.Add)
+		assert.Equal(t, stickyRule.Headers.Response.Add[setCookieHeader], fmt.Sprintf("%s; %s=%d", canary.Status.PreviousSessionAffinityCookie, maxAgeAttr, -1))
+	})
+
+	t.Run("with primary cookie", func(t *testing.T) {
+		canary := mocks.canary.DeepCopy()
+		mocks := newFixture(canary)
+		canaryCookieKey := "canary-flagger-cookie"
+		primaryCookieKey := "primary-flagger-cookie"
+		canary.Spec.Analysis.Interval = "15s"
+		canary.Spec.Analysis.SessionAffinity = &flaggerv1.SessionAffinity{
+			CookieName:        canaryCookieKey,
+			PrimaryCookieName: primaryCookieKey,
+			MaxAge:            300,
+		}
+
+		router := &IstioRouter{
+			logger:        mocks.logger,
+			flaggerClient: mocks.flaggerClient,
+			istioClient:   mocks.meshClient,
+			kubeClient:    mocks.kubeClient,
+		}
+
+		_, pSvcName, cSvcName := canary.GetServiceNames()
+		weightedRoute := &istiov1beta1.HTTPRoute{
+			Route: []istiov1beta1.HTTPRouteDestination{
+				router.makeDestination(canary, pSvcName, 100),
+				router.makeDestination(canary, cSvcName, 0),
+			},
+		}
+		rules, err := router.getSessionAffinityRouteRules(canary, 10, weightedRoute)
+		require.NoError(t, err)
+		assert.Equal(t, len(rules), 3)
+		assert.True(t, strings.HasPrefix(canary.Status.SessionAffinityCookie, canaryCookieKey))
+
+		canaryStickyRule := rules[0]
+		cookieMatch := canaryStickyRule.Match[0].Headers[cookieHeader]
+		assert.NotNil(t, cookieMatch.Regex)
+		assert.Contains(t, cookieMatch.Regex, canaryCookieKey)
+
+		assert.Equal(t, len(canaryStickyRule.Route), 2)
+		for _, route := range canaryStickyRule.Route {
+			if string(route.Destination.Host) == pSvcName {
+				assert.Equal(t, route.Weight, int(0))
+			}
+			if string(route.Destination.Host) == cSvcName {
+				assert.Equal(t, route.Weight, int(100))
+			}
+		}
+
+		primaryStickyRule := rules[1]
+		cookieMatch = primaryStickyRule.Match[0].Headers[cookieHeader]
+		assert.NotNil(t, cookieMatch.Regex)
+		assert.Contains(t, cookieMatch.Regex, primaryCookieKey)
+
+		assert.Equal(t, len(primaryStickyRule.Route), 2)
+		for _, route := range primaryStickyRule.Route {
+			if string(route.Destination.Host) == pSvcName {
+				assert.Equal(t, route.Weight, int(100))
+			}
+			if string(route.Destination.Host) == cSvcName {
+				assert.Equal(t, route.Weight, int(0))
+			}
+		}
+
+		weightedRule := rules[2]
+		var c int
+		for _, route := range weightedRule.Route {
+			if string(route.Destination.Host) == cSvcName {
+				c += 1
+
+				assert.NotNil(t, route.Headers.Response.Add)
+				assert.Equal(t, route.Headers.Response.Add[setCookieHeader], fmt.Sprintf("%s; %s=%d", canary.Status.SessionAffinityCookie, maxAgeAttr, 300))
+			}
+
+			if string(route.Destination.Host) == pSvcName {
+				c += 1
+
+				assert.NotNil(t, route.Headers.Response.Add)
+				assert.Contains(t, route.Headers.Response.Add[setCookieHeader], canary.Status.PrimarySessionAffinityCookie)
+
+				interval, err := time.ParseDuration(canary.Spec.Analysis.Interval)
+				require.NoError(t, err)
+				assert.Contains(t, route.Headers.Response.Add[setCookieHeader], fmt.Sprintf("%s=%d", maxAgeAttr, int(interval.Seconds())))
+			}
+		}
+		assert.Equal(t, 2, c)
+
+		rules, err = router.getSessionAffinityRouteRules(canary, 0, weightedRoute)
+		require.NoError(t, err)
+		assert.Empty(t, canary.Status.SessionAffinityCookie)
+		assert.Contains(t, canary.Status.PreviousSessionAffinityCookie, canaryCookieKey)
+
+		canaryStickyRule = rules[0]
+		cookieMatch = canaryStickyRule.Match[0].Headers[cookieHeader]
+		assert.NotNil(t, cookieMatch.Regex)
+		assert.Contains(t, cookieMatch.Regex, canaryCookieKey)
+
+		assert.NotNil(t, canaryStickyRule.Headers.Response.Add)
+		assert.Equal(t, canaryStickyRule.Headers.Response.Add[setCookieHeader], fmt.Sprintf("%s; %s=%d", canary.Status.PreviousSessionAffinityCookie, maxAgeAttr, -1))
+	})
+}
+
+func TestIstioRouter_GetRoutes(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	p, c, m, err := router.GetRoutes(mocks.canary)
+	require.NoError(t, err)
+	assert.Equal(t, 100, p)
+	assert.Equal(t, 0, c)
+	assert.False(t, m)
+
+	mocks.canary = newTestMirror()
+
+	err = router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	p, c, m, err = router.GetRoutes(mocks.canary)
+	require.NoError(t, err)
+	assert.Equal(t, 100, p)
+	assert.Equal(t, 0, c)
+
+	// A Canary resource with mirror on does not automatically create mirroring
+	// in the virtual server (mirroring is activated as a temporary stage).
+	assert.False(t, m)
+
+	// Adjust vs to activate mirroring.
+	vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	cHost := fmt.Sprintf("%s-canary", mocks.canary.Spec.TargetRef.Name)
+	for i, http := range vs.Spec.Http {
+		for _, route := range http.Route {
+			if route.Destination.Host == cHost {
+				vs.Spec.Http[i].Mirror = &istiov1beta1.Destination{
+					Host: cHost,
+				}
+			}
+		}
+	}
+	_, err = mocks.meshClient.NetworkingV1beta1().VirtualServices(mocks.canary.Namespace).Update(context.TODO(), vs, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	p, c, m, err = router.GetRoutes(mocks.canary)
+	require.NoError(t, err)
+	assert.Equal(t, 100, p)
+	assert.Equal(t, 0, c)
+	assert.True(t, m)
+}
+
+func TestIstioRouter_HTTPRequestHeaders(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Len(t, vs.Spec.Http, 1)
+	assert.Equal(t, "15000", vs.Spec.Http[0].Headers.Request.Add["x-envoy-upstream-rq-timeout-ms"])
+	assert.Equal(t, "test", vs.Spec.Http[0].Headers.Request.Remove[0])
+	assert.Equal(t, "token", vs.Spec.Http[0].Headers.Response.Remove[0])
+}
+
+func TestIstioRouter_CORS(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NoError(t, err)
+	require.Len(t, vs.Spec.Http, 1)
+	assert.NotNil(t, vs.Spec.Http[0].CorsPolicy)
+	assert.Len(t, vs.Spec.Http[0].CorsPolicy.AllowMethods, 2)
+}
+
+func TestIstioRouter_ABTest(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.abtest)
+	require.NoError(t, err)
+
+	// test insert
+	vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "abtest", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Len(t, vs.Spec.Http, 2)
+
+	p := 0
+	c := 100
+	m := false
+
+	err = router.SetRoutes(mocks.abtest, p, c, m)
+	require.NoError(t, err)
+
+	vs, err = mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "abtest", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	pHost := fmt.Sprintf("%s-primary", mocks.abtest.Spec.TargetRef.Name)
+	cHost := fmt.Sprintf("%s-canary", mocks.abtest.Spec.TargetRef.Name)
+	pRoute := istiov1beta1.HTTPRouteDestination{}
+	cRoute := istiov1beta1.HTTPRouteDestination{}
+	var mirror *istiov1beta1.Destination
+
+	for _, http := range vs.Spec.Http {
+		for _, route := range http.Route {
+			if route.Destination.Host == pHost {
+				pRoute = route
+			}
+			if route.Destination.Host == cHost {
+				cRoute = route
+				mirror = http.Mirror
+			}
+		}
+	}
+
+	assert.Equal(t, p, pRoute.Weight)
+	assert.Equal(t, c, cRoute.Weight)
+	assert.Nil(t, mirror)
+}
+
+func TestIstioRouter_GatewayPort(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	port := vs.Spec.Http[0].Route[0].Destination.Port.Number
+	assert.Equal(t, uint32(mocks.canary.Spec.Service.Port), port)
+}
+
+func TestIstioRouter_Delegate(t *testing.T) {
+	t.Run("ok", func(t *testing.T) {
+		mocks := newFixture(nil)
+		mocks.canary.Spec.Service.Hosts = []string{}
+		mocks.canary.Spec.Service.Gateways = []string{}
+		mocks.canary.Spec.Service.Delegation = true
+
+		router := &IstioRouter{
+			logger:        mocks.logger,
+			flaggerClient: mocks.flaggerClient,
+			istioClient:   mocks.meshClient,
+			kubeClient:    mocks.kubeClient,
+		}
+
+		err := router.Reconcile(mocks.canary)
+		require.NoError(t, err)
+
+		vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		assert.Equal(t, 0, len(vs.Spec.Hosts))
+		assert.Equal(t, 0, len(vs.Spec.Gateways))
+
+		port := vs.Spec.Http[0].Route[0].Destination.Port.Number
+		assert.Equal(t, uint32(mocks.canary.Spec.Service.Port), port)
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		mocks := newFixture(nil)
+		if len(mocks.canary.Spec.Service.Gateways) == 0 {
+			// in this case, the gateways or hosts should not be not empty because it requires to cause an error.
+			mocks.canary.Spec.Service.Gateways = []string{
+				"istio/public-gateway",
+				"mesh",
+			}
+		}
+		mocks.canary.Spec.Service.Delegation = true
+
+		router := &IstioRouter{
+			logger:        mocks.logger,
+			flaggerClient: mocks.flaggerClient,
+			istioClient:   mocks.meshClient,
+			kubeClient:    mocks.kubeClient,
+		}
+
+		err := router.Reconcile(mocks.canary)
+		require.Error(t, err)
+	})
+}
+
+func TestIstioRouter_Finalize(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	flaggerSpec := &istiov1beta1.VirtualServiceSpec{
+		Http: []istiov1beta1.HTTPRoute{
+			{
+				Match:      mocks.canary.Spec.Service.Match,
+				Rewrite:    mocks.canary.Spec.Service.GetIstioRewrite(),
+				Timeout:    mocks.canary.Spec.Service.Timeout,
+				Retries:    mocks.canary.Spec.Service.Retries,
+				CorsPolicy: mocks.canary.Spec.Service.CorsPolicy,
+			},
+		},
+	}
+
+	kubectlSpec := &istiov1beta1.VirtualServiceSpec{
+		Hosts:    []string{"podinfo"},
+		Gateways: []string{"istio-system/ingressgateway"},
+		Http: []istiov1beta1.HTTPRoute{
+			{
+				Match: nil,
+				Route: []istiov1beta1.HTTPRouteDestination{
+					{
+						Destination: istiov1beta1.Destination{Host: "podinfo"},
+					},
+				},
+			},
+		},
+	}
+
+	tables := []struct {
+		router        *IstioRouter
+		spec          *istiov1beta1.VirtualServiceSpec
+		shouldError   bool
+		createVS      bool
+		canary        *v1beta1.Canary
+		callReconcile bool
+		annotation    string
+	}{
+		// VS not found
+		{router: router, spec: nil, shouldError: true, createVS: false, canary: mocks.canary, callReconcile: false, annotation: ""},
+		// No annotation found but still finalizes
+		{router: router, spec: nil, shouldError: false, createVS: false, canary: mocks.canary, callReconcile: true, annotation: ""},
+		// Spec should match annotation after finalize
+		{router: router, spec: flaggerSpec, shouldError: false, createVS: true, canary: mocks.canary, callReconcile: true, annotation: "flagger"},
+		// Need to test kubectl annotation
+		{router: router, spec: kubectlSpec, shouldError: false, createVS: true, canary: mocks.canary, callReconcile: true, annotation: "kubectl"},
+	}
+
+	for _, table := range tables {
+		var err error
+		if table.createVS {
+			vs, err := router.istioClient.NetworkingV1beta1().VirtualServices(table.canary.Namespace).Get(context.TODO(), table.canary.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+
+			if vs.Annotations == nil {
+				vs.Annotations = make(map[string]string)
+			}
+
+			switch table.annotation {
+			case "flagger":
+				b, err := json.Marshal(table.spec)
+				require.NoError(t, err)
+				vs.Annotations[configAnnotation] = string(b)
+			case "kubectl":
+				vs.Annotations[kubectlAnnotation] = `{"apiVersion": "networking.istio.io/v1beta1","kind": "VirtualService","metadata": {"annotations": {},"name": "podinfo","namespace": "test"},  "spec": {"gateways": ["istio-system/ingressgateway"],"hosts": ["podinfo"],"http": [{"route": [{"destination": {"host": "podinfo"}}]}]}}`
+			}
+			_, err = router.istioClient.NetworkingV1beta1().VirtualServices(table.canary.Namespace).Update(context.TODO(), vs, metav1.UpdateOptions{})
+			require.NoError(t, err)
+		}
+
+		if table.callReconcile {
+			err = router.Reconcile(table.canary)
+			require.NoError(t, err)
+		}
+
+		err = router.Finalize(table.canary)
+		if table.shouldError {
+			require.Error(t, err)
+		} else {
+			require.NoError(t, err)
+		}
+
+		if table.spec != nil {
+			vs, err := router.istioClient.NetworkingV1beta1().VirtualServices(table.canary.Namespace).Get(context.TODO(), table.canary.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, *table.spec, vs.Spec)
+		}
+	}
+}
+
+func TestIstioRouter_Match(t *testing.T) {
+	mocks := newFixture(nil)
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	// service.match is not exists, analysis match is exists
+	err := router.Reconcile(mocks.abtest)
+	require.NoError(t, err)
+
+	// test insert
+	vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "abtest", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Len(t, vs.Spec.Http, 2)
+	assert.Len(t, vs.Spec.Http[0].Match, 1) // check for abtest-canary
+	require.Equal(t, vs.Spec.Http[0].Match[0].Headers["x-user-type"].Exact, "test")
+	assert.Len(t, vs.Spec.Http[1].Match, 0) // check for abtest-primary
+
+	// Test Case that is service.match exists and multiple analysis.match
+	mocks.abtest.Spec.Service.Match = []istiov1beta1.HTTPMatchRequest{
+		{
+			Name: "podinfo",
+			Uri: &istiov1alpha1.StringMatch{
+				Prefix: "/podinfo",
+			},
+			Method: &istiov1alpha1.StringMatch{
+				Exact: "GET",
+			},
+			IgnoreUriCase: true,
+		},
+	}
+	mocks.abtest.Spec.Analysis.Match = []istiov1beta1.HTTPMatchRequest{
+		{
+			Headers: map[string]istiov1alpha1.StringMatch{
+				"x-user-type": {
+					Exact: "test",
+				},
+				"x-auth-test": {
+					Exact: "test",
+				},
+			},
+		},
+		{
+			Headers: map[string]istiov1alpha1.StringMatch{
+				"x-session-id": {
+					Exact: "test",
+				},
+			},
+		},
+	}
+
+	// apply changes
+	err = router.Reconcile(mocks.abtest)
+	require.NoError(t, err)
+
+	vs, err = mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "abtest", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Len(t, vs.Spec.Http, 2)
+	assert.Len(t, vs.Spec.Http[0].Match, 2) // check for abtest-canary
+	require.Equal(t, vs.Spec.Http[0].Match[0].Uri.Prefix, "/podinfo")
+	require.Equal(t, vs.Spec.Http[0].Match[0].Headers["x-user-type"].Exact, "test")
+	require.Equal(t, vs.Spec.Http[0].Match[0].Headers["x-auth-test"].Exact, "test")
+	require.Equal(t, vs.Spec.Http[0].Match[1].Uri.Prefix, "/podinfo")
+	require.Equal(t, vs.Spec.Http[0].Match[1].Headers["x-session-id"].Exact, "test")
+	assert.Len(t, vs.Spec.Http[1].Match, 1) // check for abtest-primary
+	require.Equal(t, vs.Spec.Http[1].Match[0].Uri.Prefix, "/podinfo")
+}
+
+// TCP Canary
+func newTestCanaryTCP() *flaggerv1.Canary {
+	cd := &flaggerv1.Canary{
+		TypeMeta: metav1.TypeMeta{APIVersion: flaggerv1.SchemeGroupVersion.String()},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "podinfo",
+		},
+		Spec: flaggerv1.CanarySpec{
+			TargetRef: flaggerv1.LocalObjectReference{
+				Name:       "podinfo",
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+			},
+			Service: flaggerv1.CanaryService{
+				Port:          9898,
+				PortDiscovery: true,
+				AppProtocol:   "TCP",
+				Match: []istiov1beta1.HTTPMatchRequest{
+					{
+						Port: 9898,
+					},
+				},
+				Gateways: []string{
+					"istio/public-gateway",
+					"mesh",
+				},
+			}, Analysis: &flaggerv1.CanaryAnalysis{
+				Threshold:  10,
+				StepWeight: 10,
+				MaxWeight:  50,
+				Metrics: []flaggerv1.CanaryMetric{
+					{
+						Name:      "request-success-rate",
+						Threshold: 99,
+						Interval:  "1m",
+					},
+					{
+						Name:      "request-duration",
+						Threshold: 500,
+						Interval:  "1m",
+					},
+				},
+			},
+		},
+	}
+	return cd
+}
+
+func TestIstioRouter_SetRoutesTCP(t *testing.T) {
+	mocks := newFixture(newTestCanaryTCP())
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	pHost := fmt.Sprintf("%s-primary", mocks.canary.Spec.TargetRef.Name)
+	cHost := fmt.Sprintf("%s-canary", mocks.canary.Spec.TargetRef.Name)
+
+	t.Run("normal", func(t *testing.T) {
+		p, c := 60, 40
+		err := router.SetRoutes(mocks.canary, p, c, false)
+		require.NoError(t, err)
+
+		vs, err := mocks.meshClient.NetworkingV1beta1().VirtualServices("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		var pRoute, cRoute istiov1beta1.HTTPRouteDestination
+		for _, tcp := range vs.Spec.Tcp {
+			for _, route := range tcp.Route {
+				if route.Destination.Host == pHost {
+					pRoute = route
+				}
+				if route.Destination.Host == cHost {
+					cRoute = route
+				}
+			}
+		}
+
+		assert.Equal(t, p, pRoute.Weight)
+		assert.Equal(t, c, cRoute.Weight)
+	})
+}
+
+func TestIstioRouter_GetRoutesTCP(t *testing.T) {
+	mocks := newFixture(newTestCanaryTCP())
+	router := &IstioRouter{
+		logger:        mocks.logger,
+		flaggerClient: mocks.flaggerClient,
+		istioClient:   mocks.meshClient,
+		kubeClient:    mocks.kubeClient,
+	}
+
+	err := router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	p, c, m, err := router.GetRoutes(mocks.canary)
+	require.NoError(t, err)
+	assert.Equal(t, 100, p)
+	assert.Equal(t, 0, c)
+	assert.False(t, m)
+
+	mocks.canary = newTestMirror()
+
+	err = router.Reconcile(mocks.canary)
+	require.NoError(t, err)
+
+	p, c, m, err = router.GetRoutes(mocks.canary)
+	require.NoError(t, err)
+	assert.Equal(t, 100, p)
+	assert.Equal(t, 0, c)
+
+	// A TCP Canary resource has mirroring disabled
+	assert.False(t, m)
+}

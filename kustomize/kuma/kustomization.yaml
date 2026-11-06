@@ -1,0 +1,7 @@
+namespace: kong-mesh-system
+bases:
+  - ../base/flagger/
+patchesStrategicMerge:
+  - patch.yaml
+resources:
+  - mesh.yaml

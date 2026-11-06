@@ -1,0 +1,181 @@
+# Flagger Install on Kubernetes with Flux
+
+This guide walks you through setting up Flagger on a Kubernetes cluster the GitOps way.
+You'll configure Flux to scan the Flagger OCI artifacts and deploy the
+latest stable version on Kubernetes.
+
+## Flagger OCI artifacts
+
+Flagger OCI artifacts (container images, Helm charts, Kustomize overlays) are published to
+GitHub Container Registry, and they are signed with [Cosign](https://docs.sigstore.dev/cosign/)
+and GitHub Actions OIDC at every release.
+
+OCI artifacts
+
+- `ghcr.io/fluxcd/flagger:<version>` multi-arch container images
+- `ghcr.io/fluxcd/flagger-manifests:<version>` Kubernetes manifests
+- `ghcr.io/fluxcd/charts/flagger:<version>` Helm charts
+
+Starting with Flagger 1.43, artifacts are signed with Cosign v3 using the
+[sigstore bundle format](https://github.com/sigstore/cosign/blob/main/specs/BUNDLE_SPEC.md).
+Verifying these signatures with Flux requires **Flux 2.8 or later**.
+
+## Prerequisites
+
+To follow this guide you’ll need a Kubernetes cluster with Flux installed on it.
+Please see the Flux [get started guide](https://fluxcd.io/flux/get-started/)
+or the Flux [installation guide](https://fluxcd.io/flux/installation/).
+
+To verify the Flagger OCI artifacts at reconciliation time, Flux 2.8 or later is
+required. Earlier versions ship Cosign v2 and cannot verify the sigstore bundles
+produced by the Flagger 1.43+ release workflow.
+
+## Deploy Flagger with Flux
+
+First define the namespace where Flagger will be installed:
+
+```yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flagger-system
+  labels:
+    toolkit.fluxcd.io/tenant: sre-team
+```
+
+Define a Flux `OCIRepository` that points to where the Flagger Helm charts are stored:
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: flagger
+  namespace: flagger-system
+spec:
+  interval: 1h
+  url: oci://ghcr.io/fluxcd/charts/flagger
+  layerSelector:
+    mediaType: "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
+    operation: copy
+  ref:
+    semver: "1.x" # update to the latest version
+  verify:
+    provider: cosign
+    matchOIDCIdentity:
+      - issuer: ^https://token\.actions\.githubusercontent\.com$
+        subject: ^https://github\.com/fluxcd/flagger/\.github/workflows/release\.yml@refs/tags/v\d+\.\d+\.\d+$
+```
+
+The `.spec.verify` block instructs Flux to perform Cosign keyless verification and to
+reject the artifact unless it was signed by the Flagger release workflow running on a
+tagged release (`vX.Y.Z`). See the Flux
+[OCIRepository verification](https://fluxcd.io/flux/components/source/ocirepositories/#verification)
+documentation for more details.
+
+Define a Flux `HelmRelease` that verifies and installs Flagger's latest version on the cluster:
+
+```yaml
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: flagger
+  namespace: flagger-system
+spec:
+  interval: 12h
+  releaseName: flagger
+  install: # override existing Flagger CRDs
+    crds: CreateReplace
+  upgrade: # update Flagger CRDs
+    crds: CreateReplace
+  chartRef:
+    kind: OCIRepository
+    name: flagger
+  values:
+    nodeSelector:
+      kubernetes.io/os: linux
+```
+
+Copy the above manifests into a file called `flagger.yaml`, place the YAML file
+in the Git repository bootstrapped with Flux, then commit and push it to upstream.
+
+After Flux reconciles the changes on your cluster, you can check if Flagger got deployed with:
+
+```console
+$ helm list -n flagger-system 
+NAME    NAMESPACE       REVISION        STATUS          CHART           APP VERSION
+flagger flagger-system  1               deployed        flagger-1.42.0  1.42.0  
+```
+
+To uninstall Flagger, delete the `flagger.yaml` from your repository, then Flux will uninstall
+the Helm release and will remove the namespace from your cluster.
+
+## Deploy Flagger load tester with Flux
+
+Flagger comes with a load testing service that generates traffic during analysis when configured as a webhook.
+
+The load tester container images and deployment manifests are published to GitHub Container Registry.
+The container images and the manifests are signed with Cosign and GitHub Actions OIDC.
+
+Assuming the applications managed by Flagger are in the `apps` namespace, you can configure Flux to
+deploy the load tester there.
+
+Define a Flux `OCIRepository` that points to where the Flagger Kustomize overlays are stored:
+
+```yaml
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: flagger-loadtester
+  namespace: apps
+spec:
+  interval: 6h # scan for new versions every six hours
+  url: oci://ghcr.io/fluxcd/flagger-manifests
+  ref:
+    semver: "*" # update to the latest version
+  verify:
+    provider: cosign
+    matchOIDCIdentity:
+      - issuer: ^https://token\.actions\.githubusercontent\.com$
+        subject: ^https://github\.com/fluxcd/flagger/\.github/workflows/release\.yml@refs/tags/v\d+\.\d+\.\d+$
+```
+
+As with the Helm chart, the `.spec.verify` block ensures that only manifests signed by
+the official Flagger release workflow are fetched and applied to the cluster.
+
+Define a Flux `Kustomization` that deploys the Flagger load tester to the `apps` namespace:
+
+```yaml
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: flagger-loadtester
+  namespace: apps
+spec:
+  targetNamespace: apps
+  interval: 6h
+  wait: true
+  timeout: 5m
+  prune: true
+  sourceRef:
+    kind: OCIRepository
+    name: flagger-loadtester
+  path: ./tester
+```
+
+Copy the above manifests into a file called `flagger-loadtester.yaml`, place the YAML file
+in the Git repository bootstrapped with Flux, then commit and push it to upstream.
+
+After Flux reconciles the changes on your cluster, you can check if the load tester got deployed with:
+
+```console
+$ flux -n apps get kustomization flagger-loadtester 
+NAME              	READY	MESSAGE                                                                                    
+flagger-loadtester	True 	Applied revision: v1.23.0/a80af71e001
+```
+
+To uninstall the load tester, delete the `flagger-loadtester.yaml` from your repository, 
+and Flux will delete the load tester deployment from the cluster.
