@@ -156,6 +156,10 @@ func (kc *KnativeController) ScaleFromZero(canary *flaggerv1.Canary) error {
 	return nil
 }
 
+func (kc *KnativeController) DeletePrimaryConfigs(_ *flaggerv1.Canary) error {
+	return nil
+}
+
 func (kc *KnativeController) Finalize(canary *flaggerv1.Canary) error {
 	return nil
 }

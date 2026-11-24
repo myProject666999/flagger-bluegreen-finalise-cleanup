@@ -26,5 +26,6 @@ type Tracker interface {
 	GetConfigRefs(cd *flaggerv1.Canary) (*map[string]string, error)
 	HasConfigChanged(cd *flaggerv1.Canary) (bool, error)
 	CreatePrimaryConfigs(cd *flaggerv1.Canary, refs map[string]ConfigRef, includeLabelPrefix []string) error
+	DeletePrimaryConfigs(cd *flaggerv1.Canary) error
 	ApplyPrimaryConfigs(spec corev1.PodSpec, refs map[string]ConfigRef) corev1.PodSpec
 }

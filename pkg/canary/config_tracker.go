@@ -48,6 +48,10 @@ const (
 	ConfigRefSecret ConfigRefType = "secret"
 
 	configTrackingDisabledAnnotationKey = "flagger.app/config-tracking"
+	// PrimaryConfigCleanupDisabledAnnotation can be set on the Canary object to
+	// keep the primary copies of configs that are no longer referenced after a
+	// successful rollout. Cleanup is enabled by default.
+	PrimaryConfigCleanupDisabledAnnotationKey = "flagger.app/primary-config-cleanup"
 )
 
 // ConfigRef holds the reference to a tracked Kubernetes ConfigMap or Secret
@@ -408,6 +412,259 @@ func (ct *ConfigTracker) CreatePrimaryConfigs(cd *flaggerv1.Canary, refs map[str
 	}
 
 	return nil
+}
+
+// DeletePrimaryConfigs removes the primary copies of the ConfigMaps and Secrets
+// that Flagger created for a previous revision of the target workload but that
+// are no longer referenced by the current template.
+//
+// The retained set is derived from the current target template (GetTargetConfigs);
+// the candidates are the objects in the canary namespace that carry an owner
+// reference to this canary, plus anything still recorded in Status.TrackedConfigs.
+// No extra state is persisted, so a failed run is
+// retried on the next reconciliation. Objects that are not owned by this canary
+// are never touched, regardless of their name, and objects whose source config
+// has flagger.app/config-tracking: disabled are skipped.
+func (ct *ConfigTracker) DeletePrimaryConfigs(cd *flaggerv1.Canary) error {
+	// configs currently referenced by the target, these must be kept
+	retained, err := ct.GetTargetConfigs(cd)
+	if err != nil {
+		return fmt.Errorf("GetTargetConfigs failed: %w", err)
+	}
+
+	candidates, err := ct.listOwnedPrimaryConfigs(cd)
+	if err != nil {
+		return fmt.Errorf("listing owned primary configs failed: %w", err)
+	}
+	// also consider the configs recorded in the status, so that a copy remains a
+	// cleanup candidate even when it can no longer be discovered by ownership
+	// (for example because its owner reference was already released on a
+	// previous, partially completed run)
+	if cd.Status.TrackedConfigs != nil {
+		for ref := range *cd.Status.TrackedConfigs {
+			if configRef, err := parseConfigRefKey(ref); err == nil {
+				candidates[configRef.GetName()] = true
+			}
+		}
+	}
+
+	var errs []string
+	for ref := range candidates {
+		// still referenced by the current target template
+		if _, ok := retained[ref]; ok {
+			continue
+		}
+
+		configRef, err := parseConfigRefKey(ref)
+		if err != nil {
+			ct.Logger.Errorf("skipping malformed config ref %q: %v", ref, err)
+			continue
+		}
+
+		var deleteErr error
+		switch configRef.Type {
+		case ConfigRefMap:
+			deleteErr = ct.deletePrimaryConfigMap(cd, configRef.Name)
+		case ConfigRefSecret:
+			deleteErr = ct.deletePrimarySecret(cd, configRef.Name)
+		}
+		if deleteErr != nil {
+			errs = append(errs, deleteErr.Error())
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("deleting unreferenced primary configs failed: %s", strings.Join(errs, "; "))
+	}
+
+	return nil
+}
+
+// listOwnedPrimaryConfigs returns the "type/name" keys of the primary ConfigMaps
+// and Secrets in the canary namespace that have an owner reference to this canary.
+// The "-primary" suffix is stripped so the keys match those returned by
+// GetTargetConfigs.
+func (ct *ConfigTracker) listOwnedPrimaryConfigs(cd *flaggerv1.Canary) (map[string]bool, error) {
+	res := make(map[string]bool)
+
+	configMaps, err := ct.KubeClient.CoreV1().ConfigMaps(cd.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i := range configMaps.Items {
+		config := configMaps.Items[i]
+		if !isOwnedByCanary(config.OwnerReferences, cd) {
+			continue
+		}
+		if name, ok := primarySourceName(config.Name); ok {
+			ref := ConfigRef{Type: ConfigRefMap, Name: name}
+			res[ref.GetName()] = true
+		}
+	}
+
+	secrets, err := ct.KubeClient.CoreV1().Secrets(cd.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i := range secrets.Items {
+		secret := secrets.Items[i]
+		if !isOwnedByCanary(secret.OwnerReferences, cd) {
+			continue
+		}
+		if name, ok := primarySourceName(secret.Name); ok {
+			ref := ConfigRef{Type: ConfigRefSecret, Name: name}
+			res[ref.GetName()] = true
+		}
+	}
+
+	return res, nil
+}
+
+func primarySourceName(primaryName string) (string, bool) {
+	const suffix = "-primary"
+	if !strings.HasSuffix(primaryName, suffix) || primaryName == suffix {
+		return "", false
+	}
+	return strings.TrimSuffix(primaryName, suffix), true
+}
+
+func isOwnedByCanary(refs []metav1.OwnerReference, cd *flaggerv1.Canary) bool {
+	for _, ref := range refs {
+		if ref.Kind == flaggerv1.CanaryKind && ref.Name == cd.Name &&
+			(ref.UID == "" || cd.UID == "" || ref.UID == cd.UID) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseConfigRefKey splits a "type/name" key as stored in Status.TrackedConfigs.
+func parseConfigRefKey(key string) (ConfigRef, error) {
+	parts := strings.SplitN(key, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ConfigRef{}, fmt.Errorf("invalid config ref %q", key)
+	}
+	return ConfigRef{Type: ConfigRefType(parts[0]), Name: parts[1]}, nil
+}
+
+func resourceVersionPtr(obj metav1.Object) *string {
+	if rv := obj.GetResourceVersion(); rv != "" {
+		return &rv
+	}
+	return nil
+}
+
+func (ct *ConfigTracker) deletePrimaryConfigMap(cd *flaggerv1.Canary, name string) error {
+	// a config with tracking disabled is not managed by Flagger; its "-primary"
+	// copy (should one exist) is left alone
+	if source, err := ct.KubeClient.CoreV1().ConfigMaps(cd.Namespace).Get(context.TODO(), name, metav1.GetOptions{}); err == nil {
+		if configIsDisabled(source.GetAnnotations()) {
+			return nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("configmap %s.%s get query failed: %w", name, cd.Namespace, err)
+	}
+
+	primaryName := fmt.Sprintf("%s-primary", name)
+	config, err := ct.KubeClient.CoreV1().ConfigMaps(cd.Namespace).Get(context.TODO(), primaryName, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("configmap %s.%s get query failed: %w", primaryName, cd.Namespace, err)
+	}
+
+	owners, owned := removeCanaryOwnerRef(config.OwnerReferences, cd)
+	if !owned {
+		// not created by this canary, never touch it
+		return nil
+	}
+
+	if len(owners) > 0 {
+		clone := config.DeepCopy()
+		clone.OwnerReferences = owners
+		_, err = ct.KubeClient.CoreV1().ConfigMaps(cd.Namespace).Update(context.TODO(), clone, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("configmap %s.%s owner reference update failed: %w", primaryName, cd.Namespace, err)
+		}
+		ct.Logger.With("canary", fmt.Sprintf("%s.%s", cd.Name, cd.Namespace)).
+			Infof("ConfigMap %s released by %s.%s", primaryName, cd.Name, cd.Namespace)
+		return nil
+	}
+
+	err = ct.KubeClient.CoreV1().ConfigMaps(cd.Namespace).Delete(context.TODO(), primaryName, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{ResourceVersion: resourceVersionPtr(config)},
+	})
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("configmap %s.%s delete failed: %w", primaryName, cd.Namespace, err)
+	}
+	ct.Logger.With("canary", fmt.Sprintf("%s.%s", cd.Name, cd.Namespace)).
+		Infof("ConfigMap %s deleted", primaryName)
+	return nil
+}
+
+func (ct *ConfigTracker) deletePrimarySecret(cd *flaggerv1.Canary, name string) error {
+	// a secret with tracking disabled is not managed by Flagger; its "-primary"
+	// copy (should one exist) is left alone
+	if source, err := ct.KubeClient.CoreV1().Secrets(cd.Namespace).Get(context.TODO(), name, metav1.GetOptions{}); err == nil {
+		if configIsDisabled(source.GetAnnotations()) {
+			return nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("secret %s.%s get query failed: %w", name, cd.Namespace, err)
+	}
+
+	primaryName := fmt.Sprintf("%s-primary", name)
+	secret, err := ct.KubeClient.CoreV1().Secrets(cd.Namespace).Get(context.TODO(), primaryName, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("secret %s.%s get query failed: %w", primaryName, cd.Namespace, err)
+	}
+
+	owners, owned := removeCanaryOwnerRef(secret.OwnerReferences, cd)
+	if !owned {
+		return nil
+	}
+
+	if len(owners) > 0 {
+		clone := secret.DeepCopy()
+		clone.OwnerReferences = owners
+		_, err = ct.KubeClient.CoreV1().Secrets(cd.Namespace).Update(context.TODO(), clone, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("secret %s.%s owner reference update failed: %w", primaryName, cd.Namespace, err)
+		}
+		ct.Logger.With("canary", fmt.Sprintf("%s.%s", cd.Name, cd.Namespace)).
+			Infof("Secret %s released by %s.%s", primaryName, cd.Name, cd.Namespace)
+		return nil
+	}
+
+	err = ct.KubeClient.CoreV1().Secrets(cd.Namespace).Delete(context.TODO(), primaryName, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{ResourceVersion: resourceVersionPtr(secret)},
+	})
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("secret %s.%s delete failed: %w", primaryName, cd.Namespace, err)
+	}
+	ct.Logger.With("canary", fmt.Sprintf("%s.%s", cd.Name, cd.Namespace)).
+		Infof("Secret %s deleted", primaryName)
+	return nil
+}
+
+// removeCanaryOwnerRef removes the owner references pointing at the given canary
+// and reports whether the canary was an owner at all.
+func removeCanaryOwnerRef(refs []metav1.OwnerReference, cd *flaggerv1.Canary) ([]metav1.OwnerReference, bool) {
+	kept := make([]metav1.OwnerReference, 0, len(refs))
+	owned := false
+	for _, ref := range refs {
+		if ref.Kind == flaggerv1.CanaryKind && ref.Name == cd.Name &&
+			(ref.UID == "" || cd.UID == "" || ref.UID == cd.UID) {
+			owned = true
+			continue
+		}
+		kept = append(kept, ref)
+	}
+	return kept, owned
 }
 
 // ApplyPrimaryConfigs appends the primary suffix to all ConfigMaps and Secrets found in the PodSpec

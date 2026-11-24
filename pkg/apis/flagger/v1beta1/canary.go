@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -687,6 +688,18 @@ func (c *Canary) SkipAnalysis() bool {
 		return true
 	}
 	return c.Spec.SkipAnalysis
+}
+
+// PrimaryConfigCleanupDisabledAnnotationKey is the Canary annotation used to opt
+// out of removing primary config copies that the current template no longer
+// references. Cleanup is enabled by default.
+const PrimaryConfigCleanupDisabledAnnotationKey = "flagger.app/primary-config-cleanup"
+
+// DeletePrimaryConfigsEnabled reports whether unused primary config copies should
+// be removed after a successful promotion. It is enabled by default and can be
+// disabled with the flagger.app/primary-config-cleanup: disabled annotation.
+func (c *Canary) DeletePrimaryConfigsEnabled() bool {
+	return !strings.HasPrefix(c.GetAnnotations()[PrimaryConfigCleanupDisabledAnnotationKey], "disable")
 }
 
 // DeploymentStrategy returns the deployment strategy based on canary analysis configuration

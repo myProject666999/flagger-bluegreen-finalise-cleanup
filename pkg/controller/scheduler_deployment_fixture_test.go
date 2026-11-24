@@ -50,8 +50,11 @@ import (
 )
 
 type fixture struct {
-	canary        *flaggerv1.Canary
-	kubeClient    kubernetes.Interface
+	canary     *flaggerv1.Canary
+	kubeClient kubernetes.Interface
+	// kubeFake exposes the underlying fake clientset so tests can install
+	// reactors and simulate API failures.
+	kubeFake      *fake.Clientset
 	meshClient    clientset.Interface
 	flaggerClient clientset.Interface
 	deployer      canary.Controller
@@ -198,6 +201,7 @@ func newDeploymentFixture(c *flaggerv1.Canary) fixture {
 		}),
 		logger:        logger,
 		flaggerClient: flaggerClient,
+		kubeFake:      kubeClient,
 		meshClient:    flaggerClient,
 		kubeClient:    kubeClient,
 		ctrl:          ctrl,

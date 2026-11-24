@@ -336,6 +336,12 @@ func (c *DeploymentController) HaveDependenciesChanged(cd *flaggerv1.Canary) (bo
 	return c.configTracker.HasConfigChanged(cd)
 }
 
+// DeletePrimaryConfigs removes the primary copies of the tracked ConfigMaps and
+// Secrets that are no longer referenced by the target deployment.
+func (c *DeploymentController) DeletePrimaryConfigs(cd *flaggerv1.Canary) error {
+	return c.configTracker.DeletePrimaryConfigs(cd)
+}
+
 // Finalize will set the replica count from the primary to the reference instance.  This method is used
 // during a delete to attempt to revert the deployment back to the original state.  Error is returned if unable
 // update the reference deployment replicas to the primary replicas

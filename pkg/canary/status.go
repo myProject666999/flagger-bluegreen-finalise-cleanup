@@ -158,12 +158,20 @@ func setStatusPhase(flaggerClient clientset.Interface, cd *flaggerv1.Canary, pha
 		cdCopy.Status.Phase = phase
 		cdCopy.Status.LastTransitionTime = metav1.Now()
 
-		if phase != flaggerv1.CanaryPhaseProgressing && phase != flaggerv1.CanaryPhaseWaiting && phase != flaggerv1.CanaryPhasePromoting {
+		// The iteration counter is only reset when an analysis run ends. While
+		// waiting for the promotion gate the counter must stay at the value it
+		// reached (the configured number of iterations): the analysis keeps
+		// running in the WaitingPromotion phase, and repeated reconciliations
+		// must be idempotent instead of rewinding the counter to "re-run" a round.
+		if phase != flaggerv1.CanaryPhaseProgressing &&
+			phase != flaggerv1.CanaryPhaseWaiting &&
+			phase != flaggerv1.CanaryPhaseWaitingPromotion &&
+			phase != flaggerv1.CanaryPhasePromoting {
 			cdCopy.Status.CanaryWeight = 0
 			cdCopy.Status.Iterations = 0
-			if phase == flaggerv1.CanaryPhaseWaitingPromotion {
-				cdCopy.Status.Iterations = cd.GetAnalysis().Iterations - 1
-			}
+		} else if phase == flaggerv1.CanaryPhaseWaitingPromotion {
+			// no traffic is routed to the canary yet, but keep the iteration count
+			cdCopy.Status.CanaryWeight = 0
 		}
 
 		// on promotion set primary spec hash

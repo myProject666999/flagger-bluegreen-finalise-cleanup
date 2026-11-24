@@ -78,11 +78,10 @@ func (c *Controller) runConfirmPromotionHooks(canary *flaggerv1.Canary, canaryCo
 					if !webhook.MuteAlert {
 						c.alert(canary, "Canary promotion is waiting for approval.", false, flaggerv1.SeverityWarn)
 					}
-				} else {
-					if err := canaryController.SetStatusIterations(canary, canary.GetAnalysis().Iterations-1); err != nil {
-						c.recordEventWarningf(canary, "%v", err)
-					}
 				}
+				// The analysis keeps running while the gate is pending; the
+				// iteration counter is left untouched so that repeated checks
+				// are idempotent instead of rewinding to re-run an iteration.
 				return false
 			} else {
 				c.recordEventInfof(canary, "Confirm-promotion check %s passed", webhook.Name)

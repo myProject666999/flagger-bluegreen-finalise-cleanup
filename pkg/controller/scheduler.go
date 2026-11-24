@@ -285,6 +285,14 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 	}
 
 	if !shouldAdvance {
+		// A previous cleanup may have failed after the rollout reached Succeeded;
+		// retry it until it converges. DeletePrimaryConfigs is idempotent, so once
+		// nothing is left to remove this is a no-op.
+		if cd.Status.Phase == flaggerv1.CanaryPhaseSucceeded {
+			if _, pending := c.pendingConfigCleanup.Load(fmt.Sprintf("%s.%s", cd.Name, cd.Namespace)); pending {
+				c.cleanupPrimaryConfigs(cd, canaryController)
+			}
+		}
 		c.recorder.SetStatus(cd, cd.Status.Phase)
 		return
 	}
@@ -418,6 +426,12 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 
 		canarySucceeded := cd.DeepCopy()
 		canarySucceeded.Status.Phase = flaggerv1.CanaryPhaseSucceeded
+
+		// remove the primary copies of configs that the promoted template no
+		// longer references. A failure does not block the success status; the
+		// next cycle retries the cleanup.
+		c.cleanupPrimaryConfigs(canarySucceeded, canaryController)
+
 		c.runPostRolloutHooks(canarySucceeded, flaggerv1.CanaryPhaseSucceeded)
 		c.recordEventInfof(canarySucceeded, "Promotion completed! Scaling down %s.%s", cd.Spec.TargetRef.Name, cd.Namespace)
 		c.alert(canarySucceeded, "Canary analysis completed successfully, promotion finished.",
@@ -503,6 +517,22 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 		c.runCanary(cd, canaryController, meshRouter, mirrored, canaryWeight, primaryWeight, maxWeight)
 	}
 
+}
+
+func (c *Controller) cleanupPrimaryConfigs(canary *flaggerv1.Canary, canaryController canary.Controller) {
+	key := fmt.Sprintf("%s.%s", canary.Name, canary.Namespace)
+	if !canary.DeletePrimaryConfigsEnabled() {
+		c.pendingConfigCleanup.Delete(key)
+		return
+	}
+	if err := canaryController.DeletePrimaryConfigs(canary); err != nil {
+		// cleanup failures do not block the success status; the canary is queued
+		// for a retry on the next reconciliation
+		c.pendingConfigCleanup.Store(key, struct{}{})
+		c.recordEventWarningf(canary, "Primary config cleanup failed: %v", err)
+		return
+	}
+	c.pendingConfigCleanup.Delete(key)
 }
 
 func (c *Controller) runPromotionTrafficShift(canary *flaggerv1.Canary, canaryController canary.Controller,
@@ -679,38 +709,52 @@ func (c *Controller) runAB(canary *flaggerv1.Canary, canaryController canary.Con
 	}
 }
 
+// runBlueGreen advances a blue/green rollout. The status counter is a single
+// value with three well-defined meanings (see docs/gitbook/usage/deployment-strategies.md):
+//
+//	0 <= iterations < N   analysis round: each call runs one analysis round and
+//	                      increments the counter by one.
+//	iterations == N       promotion gate: confirm-promotion is evaluated. When it
+//	                      passes all traffic is routed to the canary and the counter
+//	                      is incremented to N+1. When it fails the phase becomes
+//	                      WaitingPromotion and the counter is left untouched, so
+//	                      repeated calls are idempotent while the analysis keeps
+//	                      running.
+//	iterations > N        promotion: the canary template is copied to the primary.
 func (c *Controller) runBlueGreen(canary *flaggerv1.Canary, canaryController canary.Controller,
 	meshRouter router.Interface, provider string, mirrored bool) {
 	primaryName := fmt.Sprintf("%s-primary", canary.Spec.TargetRef.Name)
+	iterations := canary.GetAnalysis().Iterations
 
-	// increment iterations
-	if canary.GetAnalysis().Iterations > canary.Status.Iterations {
-		// If in "mirror" mode, mirror requests during the entire B/G canary test
-		if provider != "kubernetes" &&
-			canary.GetAnalysis().Mirror && !mirrored {
-			if err := meshRouter.SetRoutes(canary, c.totalWeight(canary), 0, true); err != nil {
-				c.recordEventWarningf(canary, "%v", err)
-			}
-			c.logger.With("canary", fmt.Sprintf("%s.%s", canary.Name, canary.Namespace)).
-				Infof("Start traffic mirroring")
+	// analysis rounds
+	if canary.Status.Iterations < iterations {
+		// Mirroring must stay active for the whole analysis window. If the router
+		// no longer reports it as mirrored (for example because the routing object
+		// was edited manually) it is re-applied. When mirroring cannot be enabled
+		// the counter is not advanced and the next cycle retries.
+		if !c.ensureTrafficMirroring(canary, meshRouter, provider, mirrored) {
+			return
 		}
 		if err := canaryController.SetStatusIterations(canary, canary.Status.Iterations+1); err != nil {
 			c.recordEventWarningf(canary, "%v", err)
 			return
 		}
 		c.recordEventInfof(canary, "Advance %s.%s canary iteration %v/%v",
-			canary.Name, canary.Namespace, canary.Status.Iterations+1, canary.GetAnalysis().Iterations)
+			canary.Name, canary.Namespace, canary.Status.Iterations+1, iterations)
 		return
 	}
 
-	// check promotion gate
-	if promote := c.runConfirmPromotionHooks(canary, canaryController); !promote {
-		return
-	}
+	// promotion gate, reached exactly when the configured number of analysis
+	// rounds has completed
+	if canary.Status.Iterations == iterations {
+		if promote := c.runConfirmPromotionHooks(canary, canaryController); !promote {
+			// the analysis keeps running while waiting for approval, keep mirroring
+			c.ensureTrafficMirroring(canary, meshRouter, provider, mirrored)
+			return
+		}
 
-	// route all traffic to canary - max iterations reached
-	if canary.GetAnalysis().Iterations == canary.Status.Iterations {
-		if provider != "kubernetes" {
+		// route all traffic to canary - analysis completed
+		if provider != flaggerv1.KubernetesProvider {
 			if canary.GetAnalysis().Mirror {
 				c.recordEventInfof(canary, "Stop traffic mirroring and route all traffic to canary")
 			} else {
@@ -723,7 +767,9 @@ func (c *Controller) runBlueGreen(canary *flaggerv1.Canary, canaryController can
 			c.recorder.SetWeight(canary, 0, c.totalWeight(canary))
 		}
 
-		// increment iterations
+		// the gate has passed: mark the analysis as complete. WaitingPromotion is
+		// left in place; the next cycle (iterations > N) promotes the canary and
+		// moves the phase to Promoting.
 		if err := canaryController.SetStatusIterations(canary, canary.Status.Iterations+1); err != nil {
 			c.recordEventWarningf(canary, "%v", err)
 			return
@@ -731,8 +777,8 @@ func (c *Controller) runBlueGreen(canary *flaggerv1.Canary, canaryController can
 		return
 	}
 
-	// promote canary - max iterations reached
-	if canary.GetAnalysis().Iterations < canary.Status.Iterations {
+	// promote canary - all traffic is on the canary
+	if canary.Status.Iterations > iterations {
 		c.recordEventInfof(canary, "Copying %s.%s template spec to %s.%s",
 			canary.Spec.TargetRef.Name, canary.Namespace, primaryName, canary.Namespace)
 		if err := canaryController.Promote(canary); err != nil {
@@ -747,6 +793,25 @@ func (c *Controller) runBlueGreen(canary *flaggerv1.Canary, canaryController can
 		}
 	}
 
+}
+
+// ensureTrafficMirroring re-applies traffic mirroring when the canary analysis
+// asks for it and the router does not report it as mirrored. It is a no-op when
+// mirroring is disabled, when the provider is kubernetes (no traffic mirroring)
+// or when mirroring is already in place. It returns false when the routes could
+// not be updated, in which case the caller must not advance the analysis.
+func (c *Controller) ensureTrafficMirroring(canary *flaggerv1.Canary, meshRouter router.Interface,
+	provider string, mirrored bool) bool {
+	if provider == flaggerv1.KubernetesProvider || !canary.GetAnalysis().Mirror || mirrored {
+		return true
+	}
+	if err := meshRouter.SetRoutes(canary, c.totalWeight(canary), 0, true); err != nil {
+		c.recordEventWarningf(canary, "%v", err)
+		return false
+	}
+	c.logger.With("canary", fmt.Sprintf("%s.%s", canary.Name, canary.Namespace)).
+		Infof("Start traffic mirroring")
+	return true
 }
 
 func (c *Controller) runAnalysis(canary *flaggerv1.Canary) bool {

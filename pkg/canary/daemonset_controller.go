@@ -328,6 +328,12 @@ func (c *DaemonSetController) HaveDependenciesChanged(cd *flaggerv1.Canary) (boo
 	return c.configTracker.HasConfigChanged(cd)
 }
 
+// DeletePrimaryConfigs removes the primary copies of the tracked ConfigMaps and
+// Secrets that are no longer referenced by the target daemonset.
+func (c *DaemonSetController) DeletePrimaryConfigs(cd *flaggerv1.Canary) error {
+	return c.configTracker.DeletePrimaryConfigs(cd)
+}
+
 // Finalize scale the reference instance from zero
 func (c *DaemonSetController) Finalize(cd *flaggerv1.Canary) error {
 	if err := c.ScaleFromZero(cd); err != nil {

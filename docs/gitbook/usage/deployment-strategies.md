@@ -339,6 +339,142 @@ triggering the primary (blue) rolling update,
 this ensures a smooth transition to the new version avoiding dropping
 in-flight requests during the Kubernetes deployment rollout.
 
+### Blue/Green iteration semantics
+
+A blue/green rollout uses `status.iterations` as a single counter whose meaning
+depends on the range the value falls into. With `iterations: N`:
+
+| Counter value        | Trigger action                                            | Resulting phase |
+|----------------------|-----------------------------------------------------------|-----------------|
+| `0 <= value < N`     | run one analysis round, then increment the counter by one | `Progressing` (unchanged) |
+| `value == N`         | check the `confirm-promotion` gate. On success route all traffic to the canary and increment to `N+1`. On failure set the phase to `WaitingPromotion` and leave the counter untouched | `WaitingPromotion` on failure |
+| `value > N`          | copy the canary template to the primary                   | `Promoting` |
+
+Worked example with `iterations: 3`:
+
+| Cycle | Counter before | Action | Counter after | Phase |
+|-------|----------------|--------|---------------|-------|
+| 1     | 0 | analysis round 1 | 1 | Progressing |
+| 2     | 1 | analysis round 2 | 2 | Progressing |
+| 3     | 2 | analysis round 3 | 3 | Progressing |
+| 4     | 3 | `confirm-promotion` passes, route all traffic to canary | 4 | Progressing |
+| 5     | 4 | promote template to primary | 4 | Promoting |
+
+If `confirm-promotion` is denied on cycle 4, the phase becomes `WaitingPromotion`
+and the counter stays at 3. While the gate remains denied, the analysis keeps
+running and the counter does not move, so repeated reconciliations are
+idempotent. Once the gate passes the counter advances to 4 and cycle 5 promotes
+the canary, as above.
+
+Observable change to `status.iterations`: previously a denied gate rewound the
+counter to `N-1`, which made the value oscillate between `N-1` and `N` and
+appeared as a stalled analysis on monitoring dashboards. The value is now stable
+at `N` while the gate is pending:
+
+| Situation                              | Old `status.iterations` | New `status.iterations` |
+|----------------------------------------|-------------------------|-------------------------|
+| Analysis rounds `0..N`                 | `0..N`                  | `0..N` (unchanged)      |
+| Gate pending (`WaitingPromotion`)      | `N-1`                   | `N`                     |
+| Gate passed, traffic on canary         | `N+1`                   | `N+1` (unchanged)       |
+
+The increment-by-one pattern is otherwise unchanged, so dashboards that watch
+only the `0..N` progression are unaffected. To detect a pending gate, use
+`status.phase == WaitingPromotion` rather than inferring it from a moving counter.
+
+Blue/Green finalise ordering, after the canary has been promoted:
+
+```
+analysis complete (counter == N)
+        |
+        v
+confirm-promotion gate (WaitingPromotion while denied)
+        |
+        v
+route all traffic to canary (counter -> N+1)
+        |
+        v
+Promote: copy template to primary -> phase Promoting
+        |
+        v
+primary rollout finishes, route traffic back to primary -> phase Finalising
+        |
+        v
+PauseTargetScaler
+        |
+        v
+ScaleToZero (canary workload)
+        |
+        v
+SetStatusPhase(Succeeded)
+        |
+        v
+DeletePrimaryConfigs (unused primary config copies)
+        |
+        v
+post-rollout hook
+```
+
+Recovery paths:
+
+* **Route/mirror write fails** during an analysis round: the counter is not
+  advanced and the next cycle retries.
+* **`confirm-promotion` webhook fails**: the phase stays `WaitingPromotion`, the
+  counter is unchanged, and the next cycle re-evaluates the gate.
+* **ScaleToZero or the status write fails** during `Finalising`: the phase stays
+  `Finalising`; the next cycle repeats `ScaleToZero` (idempotent) and the status
+  update.
+* **Config cleanup fails** after `Succeeded`: the success status is not blocked;
+  the next reconciliation retries the cleanup (see [primary config cleanup](#primary-config-cleanup)).
+* **Process restart between persisting `Succeeded` and running the post-rollout
+  hook**: the hook runs *at most once*. Flagger does not persist hook execution
+  state, so a restart in that window skips it. This is the existing hook contract
+  and is documented here rather than changed.
+
+### Traffic mirroring during blue/green
+
+When `spec.analysis.mirror` is enabled, mirroring is established during the
+first analysis round and must remain active for the entire analysis window.
+Flagger re-applies mirroring on every cycle where the router no longer reports
+it as mirrored (for example after the routing object was edited by hand). If
+setting mirroring fails, the iteration counter is **not** advanced and the next
+cycle retries, so a cycle in which mirroring never took effect is not counted as
+an analysed round.
+
+The `kubernetes` provider has neither traffic mirroring nor traffic switching.
+For that provider the counter keeps its analysis-round meaning and Flagger forces
+`iterations` to at least 10 so a rollout always completes in a bounded number of
+cycles.
+
+### Primary config cleanup
+
+When the target references ConfigMaps or Secrets, Flagger makes `-primary`
+copies for the primary workload. After a successful promotion, `-primary` copies
+that the promoted template no longer references are removed.
+
+* Cleanup runs only when the phase reaches `Succeeded`; a `Failed` rollout keeps
+  the copies because a rollback leaves the primary template unchanged.
+* An object is considered for deletion only if it carries an owner reference to
+  this canary. Objects that Flagger did not create — including user-created
+  objects whose name merely ends in `-primary` — are never touched. The decision
+  is based solely on owner references, never on the name pattern.
+* When a `-primary` copy is shared between canaries (the other canaries appear as
+  non-controller owner references), only this canary's owner reference is removed;
+  the object is deleted only when no owner remains.
+* ConfigMaps/Secrets annotated with `flagger.app/config-tracking: disabled` are
+  not managed by Flagger and are left untouched.
+* The "keep" set is derived from the current template using the same parsing as
+  config tracking (volumes, `envFrom` and `env.valueFrom`); no extra state is
+  persisted. If cleanup fails it does not block `Succeeded` — an event is
+  recorded and the next reconciliation retries until it converges.
+* Deletes carry a `resourceVersion` precondition so a copy that was just updated
+  by another canary is not removed by mistake.
+* Cleanup is enabled by default. To keep unused `-primary` copies, annotate the
+  Canary with `flagger.app/primary-config-cleanup: disabled`.
+* Retries are tracked in memory per process: a cleanup that fails is retried on
+  each following reconciliation until it converges. If the process restarts
+  before the retry succeeds, cleanup converges on the next successful rollout
+  (the "keep" set is always re-derived, so nothing is lost).
+
 ## Blue/Green with Traffic Mirroring
 
 Traffic Mirroring is a pre-stage in a Canary (progressive traffic shifting) or Blue/Green deployment strategy.

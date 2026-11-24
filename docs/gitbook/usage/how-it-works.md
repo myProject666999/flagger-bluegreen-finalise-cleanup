@@ -120,6 +120,13 @@ command flag in the Flagger deployment manifest under containers args
 or by setting `--set configTracking.enabled=false` when installing Flagger with Helm,
 but disabling config-tracking using the per Secret/ConfigMap annotation may fit your use-case better.
 
+After a rollout succeeds, Flagger removes the `-primary` copies that the promoted
+template no longer references. Cleanup only deletes objects that carry an owner
+reference to the Canary and keeps copies shared with other canaries until no owner
+remains; see [primary config cleanup](deployment-strategies.md#primary-config-cleanup)
+for the full rules. To keep unused `-primary` copies, annotate the Canary with
+`flagger.app/primary-config-cleanup: disabled`.
+
 The autoscaler reference is optional, when specified,
 Flagger will pause the traffic increase while the target and primary deployments are scaled up or down.
 HPA can help reduce the resource usage during the canary analysis.

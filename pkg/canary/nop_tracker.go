@@ -41,6 +41,10 @@ func (nt *NopTracker) CreatePrimaryConfigs(*flaggerv1.Canary, map[string]ConfigR
 	return nil
 }
 
+func (nt *NopTracker) DeletePrimaryConfigs(*flaggerv1.Canary) error {
+	return nil
+}
+
 func (nt *NopTracker) ApplyPrimaryConfigs(spec corev1.PodSpec, _ map[string]ConfigRef) corev1.PodSpec {
 	return spec
 }

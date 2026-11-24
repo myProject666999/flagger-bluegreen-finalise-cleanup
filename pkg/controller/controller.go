@@ -73,6 +73,12 @@ type Controller struct {
 	eventWebhook         string
 	clusterName          string
 	noCrossNamespaceRefs bool
+	// pendingConfigCleanup records the canaries whose post-promotion config
+	// cleanup failed and must be retried on the next reconciliation. It is
+	// deliberately in-memory (not a persisted status field): the "should keep"
+	// set is always re-derived from the target template, so a retry after a
+	// process restart is deferred to the next rollout rather than lost.
+	pendingConfigCleanup sync.Map
 }
 
 type Informers struct {
